@@ -167,14 +167,39 @@ if(del){const b=books.find(x=>x.id===del.dataset.delete);if(b&&confirm(`Delete "
 };
 $("continueFab").onclick=()=>{const id=$("continueFab").dataset.continue;if(id)openReader(id)};
 
-let pageObserver;
+const PAGE_BATCH_SIZE=50,PAGE_BEFORE=5;
+let pageObserver,pageLoadPromises=new Map();
 function setupObserver(){
 if(pageObserver)pageObserver.disconnect();
 pageObserver=new IntersectionObserver(entries=>{
 entries.forEach(entry=>{
-if(entry.isIntersecting&&entry.target.dataset.rendered!=="1")renderPage(entry.target)
+if(entry.isIntersecting&&entry.target.dataset.rendered!=="1")renderPage(entry.target).catch(e=>console.error("Page render failed",e))
 })
 },{root:readerContent,rootMargin:"1000px 0px 1000px 0px"});
+}
+
+function pageWindow(page,total){
+const start=Math.max(1,Math.min(page-PAGE_BEFORE,total-PAGE_BATCH_SIZE+1));
+return {start,end:Math.min(total,start+PAGE_BATCH_SIZE-1)};
+}
+
+async function loadPage(n){
+const canvas=pageElements[n-1];
+if(!canvas||canvas.dataset.loaded==="1")return;
+if(pageLoadPromises.has(n))return pageLoadPromises.get(n);
+const promise=(async()=>{
+const page=await currentPdf.getPage(n),scale=+canvas.dataset.scale;
+const view=page.getViewport({scale});
+canvas.style.width=view.width+"px";canvas.style.height=view.height+"px";
+canvas.dataset.loaded="1";
+})();
+pageLoadPromises.set(n,promise);
+try{await promise}finally{pageLoadPromises.delete(n)}
+}
+
+async function loadPageWindow(page,total){
+const {start,end}=pageWindow(page,total);
+for(let n=start;n<=end;n++)await loadPage(n);
 }
 
 async function openReader(id){
@@ -197,15 +222,19 @@ throw new Error("This book's saved file is missing. Please delete it and re-add 
 currentPdf=await pdfjsLib.getDocument({data}).promise;
 home.classList.add("hidden");reader.classList.remove("hidden");document.body.style.overflow="hidden";if(!(history.state&&history.state.reader))history.pushState({reader:1},"");
 $("readerBookTitle").textContent=book.title;pages.innerHTML="";pageElements=[];
+pageLoadPromises=new Map();
 setupObserver();
 const max=pages.clientWidth||Math.min(900,window.innerWidth-20);
+const estimatePage=await currentPdf.getPage(1),estimateScale=max/estimatePage.getViewport({scale:1}).width,estimateView=estimatePage.getViewport({scale:estimateScale});
+const initialPage=Math.max(1,Math.min(currentPdf.numPages,Number(book.currentPage)||Math.round(savedRatio*(currentPdf.numPages-1))+1));
+const initialWindow=pageWindow(initialPage,currentPdf.numPages);
 for(let n=1;n<=currentPdf.numPages;n++){
-$("loadingText").textContent=`Preparing page ${n} of ${currentPdf.numPages}...`;
-const page=await currentPdf.getPage(n),base=page.getViewport({scale:1}),scale=max/base.width,view=page.getViewport({scale});
-const canvas=document.createElement("canvas");canvas.className="pdf-page";canvas.dataset.page=n;canvas.dataset.rendered="0";
-canvas.dataset.scale=scale;canvas.style.width=view.width+"px";canvas.style.height=view.height+"px";
+const canvas=document.createElement("canvas");canvas.className="pdf-page";canvas.dataset.page=n;canvas.dataset.rendered="0";canvas.dataset.loaded="0";
+canvas.dataset.scale=estimateScale;canvas.style.width=estimateView.width+"px";canvas.style.height=estimateView.height+"px";
 pages.appendChild(canvas);pageElements.push(canvas);
 }
+$("loadingText").textContent=`Preparing pages ${initialWindow.start}-${initialWindow.end} of ${currentPdf.numPages}...`;
+await loadPageWindow(initialPage,currentPdf.numPages);
 await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
 restorePosition(savedRatio);restoring=false;updateProgress();pageElements.forEach(el=>pageObserver.observe(el));
 }catch(err){restoring=false;console.error(err);alert("Could not open this book.\n\n"+err.message);requestClose()}finally{hideLoading()}
@@ -213,7 +242,9 @@ restorePosition(savedRatio);restoring=false;updateProgress();pageElements.forEac
 
 async function renderPage(canvas){
 canvas.dataset.rendered="1";
-const n=+canvas.dataset.page,scale=+canvas.dataset.scale;
+const n=+canvas.dataset.page;
+await loadPage(n);
+const scale=+canvas.dataset.scale;
 const page=await currentPdf.getPage(n),view=page.getViewport({scale});
 const dpr=Math.min(devicePixelRatio||1,2),ctx=canvas.getContext("2d");
 canvas.width=Math.floor(view.width*dpr);canvas.height=Math.floor(view.height*dpr);
@@ -231,6 +262,7 @@ const max=Math.max(1,readerContent.scrollHeight-readerContent.clientHeight),top=
 let pg=1;for(const el of pageElements){if(el.offsetTop<=target)pg=+el.dataset.page;else break}
 currentBook.currentPage=pg;currentBook.scrollRatio=ratio;currentBook.progress=pct;
 $("readerProgressBar").style.width=pct+"%";$("readerPercentage").textContent=pct+"%";$("readerPageText").textContent=`Page ${pg} / ${currentBook.totalPages}`;$("readerPageNumber").textContent=`Page ${pg} of ${currentBook.totalPages}`;
+loadPageWindow(pg,currentBook.totalPages).catch(e=>console.error("Page loading failed",e));
 }
 let saveTimer,restoring=false;
 function saveProgress(){if(!currentBook||restoring)return;const book=currentBook;clearTimeout(saveTimer);saveTimer=setTimeout(async()=>{await putBook(book);books=books.map(b=>b.id===book.id?book:b)},150)}
@@ -241,7 +273,7 @@ reader.addEventListener("click",e=>{if(e.target.closest("button"))return;control
 function requestClose(){if(history.state&&history.state.reader)history.back();else closeReader()}
 window.addEventListener("popstate",()=>{if(!reader.classList.contains("hidden"))closeReader()});
 $("readerBack").onclick=e=>{e.stopPropagation();requestClose()};
-function closeReader(){clearTimeout(saveTimer);const book=currentBook;reader.classList.add("hidden");home.classList.remove("hidden");document.body.style.overflow="";if(pageObserver)pageObserver.disconnect();currentPdf=null;currentBook=null;pages.innerHTML="";pageElements=[];if(book){putBook(book);books=books.map(b=>b.id===book.id?book:b)}render()}
+function closeReader(){clearTimeout(saveTimer);const book=currentBook;reader.classList.add("hidden");home.classList.remove("hidden");document.body.style.overflow="";if(pageObserver)pageObserver.disconnect();currentPdf=null;currentBook=null;pageLoadPromises=new Map();pages.innerHTML="";pageElements=[];if(book){putBook(book);books=books.map(b=>b.id===book.id?book:b)}render()}
 document.addEventListener("keydown",e=>{if(reader.classList.contains("hidden"))return;if(e.key==="Escape")requestClose();if(e.key==="ArrowDown")readerContent.scrollBy({top:innerHeight*.8,behavior:"smooth"});if(e.key==="ArrowUp")readerContent.scrollBy({top:-innerHeight*.8,behavior:"smooth"})});
 document.addEventListener("visibilitychange",()=>{if(document.hidden)saveProgress()});
 
